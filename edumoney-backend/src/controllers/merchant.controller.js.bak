@@ -1,0 +1,630 @@
+import Merchant from "../models/merchant.model.js";
+import School from "../models/school.model.js";
+import Wallet from "../models/wallet.js";
+import Category from "../models/Category.model.js";
+import Produt from "../models/Produt.model.js";
+import mongoose from "mongoose";
+import { writeAuditLog } from "../utils/auditLogger.js";
+
+export const createMerchant = async (req, res) => {
+  try {
+    const { name, category, schoolId, nif, password } = req.body;
+
+    const school = await School.findById(schoolId);
+    if (!school) {
+      return res.status(400).send({ message: "Escola nao encontrada" });
+    }
+
+    
+    // Criar merchant
+    const merchant = await Merchant.create({
+      name,
+      category,
+      schoolId,
+      nif,
+      password,
+    });
+
+    console.log("Errro no mercador")
+
+    // Criar wallet automaticamente (NOVO MODELO)
+    const wallet = await Wallet.create({
+      ownerId: merchant._id,
+      ownerModel: "Merchant",
+      balance: 0,
+      currency: "AOA",
+      status: "active",
+    });
+
+    // Associar wallet ao merchant
+    merchant.walletId = wallet._id;
+    await merchant.save();
+
+    await writeAuditLog({
+      userId: merchant._id,
+      userModel: "Merchant",
+      action: "MERCHANT_CREATED",
+      entity: "Merchant",
+      entityId: merchant._id,
+      status: "success",
+      schoolId: merchant.schoolId,
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+
+    console.log(merchant)
+    
+
+
+    res.status(201).send({
+      message: "Comerciante criado com sucesso",
+      merchant,
+      wallet,
+    });
+  } catch (error) {
+    console.log(error.message)
+    res.status(500).send({ message: error.message });
+  }
+};
+
+export const getMerchantBySchool = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+    const merchants = await Merchant.find({ schoolId }).populate("walletId");
+
+    res.status(200).send(merchants);
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+};
+
+export const updateMerchant = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    // ===================================
+    // AUTHORIZED FIELDS FOR UPDATE
+    // ===================================
+    const allowedFields = [
+      "name",
+      "email",
+      "category",
+      "phone",
+      "description",
+      "address",
+      "profilePicture",
+      "preferences",
+      "notificationSettings",
+    ];
+
+    // ===================================
+    // FORBIDDEN FIELDS (Never update via API)
+    // ===================================
+    const forbiddenFields = [
+      "_id",
+      "nif", // NIF cannot be changed (business identifier)
+      "password", // Use separate password change endpoint
+      "schoolId", // Cannot change school affiliation
+      "walletId", // Wallet is managed by system
+      "role", // Role is immutable
+      "isActive", // Use separate activation endpoint
+      "termsAccepted",
+      "termsAcceptedAt",
+    ];
+
+    // ===================================
+    // VALIDATE: No forbidden fields
+    // ===================================
+    for (const field of Object.keys(updates)) {
+      if (forbiddenFields.includes(field)) {
+        return res.status(400).send({
+          message: `Campo "${field}" não pode ser atualizado`,
+          allowedFields,
+        });
+      }
+    }
+
+    // ===================================
+    // VALIDATE: Only allowed fields
+    // ===================================
+    const filteredUpdates = {};
+    for (const field of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(updates, field)) {
+        filteredUpdates[field] = updates[field];
+      }
+    }
+
+    // ===================================
+    // WARN: If no valid fields provided
+    // ===================================
+    if (Object.keys(filteredUpdates).length === 0) {
+      return res.status(400).send({
+        message: "Nenhum campo válido para atualizar",
+        allowedFields,
+      });
+    }
+
+    // ===================================
+    // FIND MERCHANT
+    // ===================================
+    const merchant = await Merchant.findById(id);
+    if (!merchant) {
+      return res.status(404).send({ message: "Comerciante não encontrado" });
+    }
+
+    // ===================================
+    // VALIDATE: User is updating own profile or is admin
+    // ===================================
+    if (req.user._id.toString() !== id) {
+      // Check if requester is admin/school for this merchant
+      if (req.userModel !== "School" || req.user._id.toString() !== merchant.schoolId.toString()) {
+        return res.status(403).send({
+          message: "Não tem permissão para atualizar este perfil",
+        });
+      }
+    }
+
+    // ===================================
+    // APPLY UPDATES
+    // ===================================
+    Object.assign(merchant, filteredUpdates);
+    await merchant.save();
+
+    // ===================================
+    // AUDIT LOG
+    // ===================================
+    await writeAuditLog({
+      userId: req.user._id,
+      userModel: req.userModel,
+      action: "MERCHANT_PROFILE_UPDATED",
+      entity: "Merchant",
+      entityId: merchant._id,
+      status: "success",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+      schoolId: merchant.schoolId,
+      metadata: {
+        updatedFields: Object.keys(filteredUpdates),
+        fieldCount: Object.keys(filteredUpdates).length,
+      },
+    }).catch(() => {});
+
+    // ===================================
+    // RETURN UPDATED MERCHANT
+    // ===================================
+    res.status(200).send({
+      message: `Perfil atualizado com sucesso (${Object.keys(filteredUpdates).length} campo(s))`,
+      merchant,
+      userData: merchant,
+      updatedFields: Object.keys(filteredUpdates),
+    });
+  } catch (error) {
+    console.error("[MerchantController] Error updating merchant:", error);
+    res.status(500).send({
+      message: "Erro ao atualizar comerciante",
+      error: error.message,
+    });
+  }
+};
+
+export const deleteMerchant = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deleted = await Merchant.findByIdAndDelete(id);
+    if (!deleted)
+      return res.status(404).send({ message: "comerciante nao encontrado" });
+
+    // Eliminar a carteira vinculada ao comerciante
+    await Wallet.findOneAndDelete({
+      ownerId: deleted._id,
+      ownerModel: "Merchant",
+    });
+
+    await writeAuditLog({
+      userId: deleted._id,
+      userModel: "Merchant",
+      action: "MERCHANT_DELETED",
+      entity: "Merchant",
+      entityId: deleted._id,
+      status: "success",
+      schoolId: deleted.schoolId,
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+    });
+
+    res.status(200).send({
+      message: "comerciante removido com sucesso",
+    });
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+};
+
+// Atualizar status do comerciante (ativar/desativar)
+export const updateMerchantStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isActive } = req.body;
+    const schoolId = req.user._id;
+
+    if (typeof isActive !== "boolean") {
+      return res.status(400).send({
+        message: "O campo isActive deve ser um boolean",
+      });
+    }
+
+    const merchant = await Merchant.findById(id);
+    
+    if (!merchant) {
+      return res.status(404).send({
+        message: "Comerciante nao encontrado",
+      });
+    }
+
+    // Verificar se o merchant pertence a esta escola
+    if (String(merchant.schoolId) !== String(schoolId)) {
+      return res.status(403).send({
+        message: "Nao autorizado a alterar este comerciante",
+      });
+    }
+
+    merchant.isActive = isActive;
+    await merchant.save();
+
+    await writeAuditLog({
+      userId: schoolId, userModel: "School",
+      action: isActive ? "MERCHANT_ACTIVATED" : "MERCHANT_DEACTIVATED",
+      entity: "Merchant", entityId: merchant._id, status: "success",
+      schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: { merchantId: merchant._id, isActive },
+    }).catch(() => {});
+
+    return res.status(200).send({
+      message: isActive ? "Comerciante ativado com sucesso" : "Comerciante desativado com sucesso",
+      merchant,
+    });
+  } catch (error) {
+    console.error("Erro ao atualizar status:", error);
+    res.status(500).send({ message: error.message });
+  }
+};
+
+// Criar categoria
+export const createCategory = async (req, res) => {
+  try {
+    const { merchantId } = req.params;
+    const { schoolId, categoryName } = req.body;
+
+    if (!merchantId || !schoolId || !categoryName) {
+      return res.status(400).send({
+        message: "Envie todos os campos: merchantId, schoolId, categoryName",
+      });
+    }
+
+    const normalizedCategoryName = categoryName.trim().toLowerCase();
+
+    const category = await Category.findOne({
+      merchantId,
+      schoolId,
+      name: normalizedCategoryName,
+    });
+
+    if (category) {
+      return res.status(400).send({ message: "Categoria já existe" });
+    }
+
+    const newCategory = new Category({
+      merchantId,
+      schoolId,
+      name: normalizedCategoryName,
+    });
+
+    await newCategory.save();
+
+    await writeAuditLog({
+      userId: req.user?._id || schoolId,
+      userModel: req.userModel || "School",
+      action: "MERCHANT_CATEGORY_CREATED",
+      entity: "Category",
+      entityId: newCategory._id,
+      status: "success",
+      schoolId,
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+      metadata: {
+        merchantId,
+        categoryName: normalizedCategoryName,
+      },
+    }).catch(() => {});
+
+    res.status(201).send({
+      message: "Categoria cadastrada com sucesso",
+      category: newCategory,
+    });
+  } catch (error) {
+    console.error("Erro em createCategory:", error);
+    res.status(500).send({ message: "Erro do servidor em categorias" });
+  }
+};
+
+// Listar categorias de um merchant
+export const getCategoriesByMerchant = async (req, res) => {
+  try {
+    const { merchantId } = req.params;
+
+    if (!merchantId) {
+      return res.status(400).send({ message: "merchantId é obrigatório" });
+    }
+
+    const categories = await Category.find({ merchantId }).sort({
+      createdAt: -1,
+    }); // ordena alfabeticamente
+    res.status(200).send(categories);
+  } catch (error) {
+    console.error("Erro em getCategoriesByMerchant:", error);
+    res.status(500).send({ message: "Erro ao buscar categorias" });
+  }
+};
+// Deletar categoria com remoção em cascata dos produtos
+export const deleteCategory = async (req, res) => {
+  try {
+    const { merchantId, categoryId } = req.params;
+
+    if (!merchantId || !categoryId) {
+      return res
+        .status(400)
+        .send({ message: "merchantId e categoryId são obrigatórios" });
+    }
+
+    // Deleta a categoria
+    const deletedCategory = await Category.findOneAndDelete({
+      _id: categoryId,
+      merchantId,
+    });
+
+    if (!deletedCategory) {
+      return res.status(404).send({ message: "Categoria não encontrada" });
+    }
+
+    // Deleta todos os produtos vinculados a essa categoria
+    await Produt.deleteMany({ categoryId: deletedCategory._id });
+
+    res.status(200).send({
+      message: "Categoria e todos os produtos vinculados removidos com sucesso",
+      category: deletedCategory,
+    });
+  } catch (error) {
+    console.error("Erro em deleteCategory:", error);
+    res.status(500).send({ message: "Erro ao deletar categoria" });
+  }
+};
+
+// Produtos
+export const createProduct = async (req, res) => {
+  try {
+    const { schoolId, name, price, quantity, categoryName, img } = req.body;
+    const merchantId = req.params.merchantId;
+
+    // validar campos
+    if (!name || !price || !quantity || !schoolId)
+      return res.status(400).send({ message: "Campos obrigatorios faltando" });
+
+    if (!mongoose.Types.ObjectId.isValid(merchantId))
+      return res.status(400).send({ message: "MerchantId invalido" });
+
+    // Verificar se já existe um produto com o mesmo nome (case-insensitive)
+    const existingProduct = await Produt.findOne({
+      merchantId,
+      name: { $regex: `^${name.trim()}$`, $options: "i" }, // i = ignore case
+    });
+
+    if (existingProduct)
+      return res
+        .status(400)
+        .json({ message: "Já existe um produto com esse nome" });
+
+    // Buscar categoria existente pelo nome
+    let categoryId = null;
+    if (categoryName) {
+      const category = await Category.findOne({
+        merchantId,
+        name: categoryName,
+      });
+
+      if (!category)
+        return res.status(400).json({
+          message: "Categoria não encontrada. Crie a categoria primeiro",
+        });
+
+      categoryId = category._id;
+    }
+
+    // Criar o produto
+    const newProduct = await Produt.create({
+      merchantId,
+      schoolId,
+      name: name.trim(),
+      price,
+      quantity,
+      categoryId,
+      img: img || null,
+    });
+
+    return res
+      .status(201)
+      .json({ message: "Produto criado com sucesso", product: newProduct });
+  } catch (error) {
+    console.error("Erro em createProduct:", error);
+    return res.status(500).json({ message: "Erro ao criar produto" });
+  }
+};
+export const getProductByMerchant = async (req, res) => {
+  try {
+    const merchantId = req.params.merchantId;
+
+    if (!mongoose.Types.ObjectId.isValid(merchantId))
+      return res.status(400).send({ message: "MerchantId invalido" });
+
+    const produts = await Produt.find({ merchantId })
+      .populate("categoryId", "name")
+      .sort({ createdAt: -1 });
+
+    return res.status(200).send({ message: "Sucesso", product: produts });
+  } catch (error) {
+    console.error("Erro em getProductsByMerchant:", error);
+    return res.status(500).json({ message: "Erro ao buscar produtos" });
+  }
+};
+
+export const updateProduct = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const productId = req.params.id;
+    const { name, price, quantity, categoryName, img, isActive } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(productId)) {
+      return res.status(400).json({ message: "Produto inválido" });
+    }
+
+    const product = await Produt.findById(productId).session(session);
+    if (!product) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: "Produto não encontrado" });
+    }
+
+    // Atualização condicional
+    if (name && name.trim() !== product.name) product.name = name.trim();
+
+    if (price !== undefined && price !== product.price) product.price = price;
+
+    if (quantity !== undefined && quantity !== product.quantity)
+      product.quantity = quantity;
+
+    if (img !== undefined && img !== product.img) product.img = img;
+
+    if (isActive !== undefined && isActive !== product.isActive)
+      product.isActive = isActive;
+
+    if (categoryName) {
+      const category = await Category.findOne({
+        merchantId: product.merchantId,
+        name: categoryName,
+      }).session(session);
+
+      if (!category) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(404).json({ message: "Categoria não encontrada" });
+      }
+
+      if (!product.categoryId.equals(category._id)) {
+        product.categoryId = category._id;
+      }
+    }
+
+    //Verificar se algo mudou antes de salvar
+    if (!product.isModified()) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(200).json({
+        success: false,
+        unchanged: true,
+        message: "Nenhuma alteração detectada",
+      });
+    }
+
+    await product.save({ session });
+
+    await product.populate("categoryId");
+
+    await session.commitTransaction();
+    session.endSession();
+
+    return res.status(200).json({
+      message: "Produto atualizado com sucesso",
+      product,
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    console.error("Erro em updateProduct:", error);
+    return res.status(500).json({ message: "Erro ao atualizar produto" });
+  }
+};
+
+export const deleteProduct = async (req, res) => {
+  try {
+    const productId = req.params.id;
+
+    if (!mongoose.Types.ObjectId.isValid(productId)) {
+      return res.status(400).json({ message: "Produto inválido" });
+    }
+
+    const product = await Produt.findByIdAndDelete(productId);
+    if (!product)
+      return res.status(404).json({ message: "Produto não encontrado" });
+
+    return res.status(200).json({ message: "Produto deletado com sucesso" });
+  } catch (error) {
+    console.error("Erro em deleteProduct:", error);
+    return res.status(500).json({ message: "Erro ao deletar produto" });
+  }
+};
+
+export const changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    const { merchantId } = req.params;
+
+    if (String(merchantId) !== String(req.user._id)) {
+      return res.status(403).json({ message: "Não autorizado" });
+    }
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: "Preencha todos os campos" });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ message: "A senha deve ter pelo menos 8 caracteres" });
+    }
+
+    const merchant = await Merchant.findById(merchantId).select("+password");
+    if (!merchant) {
+      return res.status(404).json({ message: "Comerciante não encontrado" });
+    }
+
+    const isMatch = await merchant.matchPassword(currentPassword);
+    if (!isMatch) {
+      return res.status(400).json({ message: "Senha atual incorreta" });
+    }
+
+    const isSamePassword = await merchant.matchPassword(newPassword);
+    if (isSamePassword) {
+      return res.status(400).json({ message: "A nova senha deve ser diferente da atual" });
+    }
+
+    merchant.password = newPassword;
+    await merchant.save();
+
+    await writeAuditLog({
+      userId: merchant._id,
+      userModel: "Merchant",
+      action: "PASSWORD_CHANGED",
+      entity: "Merchant",
+      entityId: merchant._id,
+      status: "success",
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+      schoolId: merchant.schoolId,
+    }).catch(() => {});
+
+    res.status(200).json({ message: "Senha atualizada com sucesso" });
+  } catch (error) {
+    console.error("Erro ao alterar senha do comerciante:", error);
+    res.status(500).json({ message: "Erro interno ao alterar senha" });
+  }
+};

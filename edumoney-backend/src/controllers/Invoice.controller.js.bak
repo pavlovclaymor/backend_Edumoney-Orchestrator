@@ -1,0 +1,454 @@
+import Invoice from "../models/invoice.model.js";
+import Merchant from "../models/merchant.model.js";
+import mongoose from "mongoose";
+import Transaction from "../models/transaction.js";
+import Wallet from "../models/wallet.js";
+
+import {
+  createInvoiceservice,
+  getInvoicePDFPath,
+} from "../services/invoice.service.js";
+
+import { generateInvoicePDF } from "../services/pdf.service.js";
+import { createNotification } from "./notification.controller.js";
+import { getIO } from "../socket/index.js";
+import { SOCKET_EVENTS } from "../socket/events.js";
+import QRCode from "qrcode";
+import { writeAuditLog } from "../utils/auditLogger.js";
+
+/**
+ * POST /api/invoices/sales/create
+ * Query body: merchantId, schoolId, ...date
+ * criar facturas
+ */
+export const createInvoice = async (req, res) => {
+  try {
+    const { schoolId, ...invoiceData } = req.body;
+
+    // merchantId lido do token JWT (req.user._id), não do body
+    const merchantId = req.user?._id;
+
+    if (!merchantId) {
+      return res.status(401).send({ message: "Não autenticado" });
+    }
+
+    if (!schoolId) {
+      return res.status(400).send({ message: "schoolId é obrigatório" });
+    }
+
+    const invoice = await createInvoiceservice({
+      ...invoiceData,
+      schoolId,
+      merchantId,
+    });
+
+    if (!invoice) {
+      await writeAuditLog({
+        userId: merchantId, userModel: "Merchant", action: "INVOICE_CREATED",
+        entity: "Invoice", entityId: null, status: "failed",
+        schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      }).catch(() => {});
+      return res.status(400).send({ message: "Erro ao criar invoice" });
+    }
+
+   await writeAuditLog({
+        userId: merchantId, userModel: "Merchant", action: "INVOICE_CREATED",
+        entity: "Invoice", entityId: invoice._id, status: "success",
+        schoolId: invoice.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      }).catch(() => {});
+
+    res.status(201).send({ invoice });
+  } catch (error) {
+    res.status(400).send({ message: error.message });
+  }
+};
+
+/**
+ * GET /api/invoices/sales/today
+ * Query params: merchantId, schoolId
+ */
+export const getTodaySales = async (req, res) => {
+  try {
+    // merchantId lido do token JWT; schoolId vem da query (necessário para validar pertença)
+    const merchantId = req.user?._id?.toString();
+    const { schoolId } = req.query;
+
+    if (!merchantId) {
+      return res.status(401).json({ message: "Não autenticado" });
+    }
+
+    if (!schoolId) {
+      return res.status(400).json({ message: "schoolId é obrigatório" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(schoolId)) {
+      return res.status(400).json({ message: "schoolId inválido" });
+    }
+
+    //  garantir que o merchant pertence à escola
+    const merchant = await Merchant.findOne({
+      _id: new mongoose.Types.ObjectId(merchantId),
+      schoolId: new mongoose.Types.ObjectId(schoolId),
+    });
+
+    if (!merchant) {
+      return res.status(404).json({
+        message: "Mercador não encontrado para esta escola",
+      });
+    }
+
+    //  intervalo do dia atual (ajustado para timezone local)
+    const now = new Date();
+    const startOfDay = new Date(now);
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const endOfDay = new Date(now);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    // aggregation das vendas do dia
+    const sales = await Invoice.aggregate([
+      {
+        $match: {
+          merchantId: new mongoose.Types.ObjectId(merchantId),
+          status: "paid",
+          issuedAt: {
+            $gte: startOfDay,
+            $lte: endOfDay,
+          },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalSales: { $sum: "$totalAmount" },
+          totalInvoices: { $sum: 1 },
+          invoices: {
+            $push: {
+              invoiceNumber: "$invoiceNumber",
+              totalAmount: "$totalAmount",
+              issuedAt: "$issuedAt",
+              paymentMethod: "$paymentMethod",
+              status: "$status",
+            },
+          },
+        },
+      },
+    ]);
+
+    //  resposta padrão
+    if (!sales.length) {
+      return res.status(200).json({
+        totalSales: 0,
+        totalInvoices: 0,
+        invoices: [],
+      });
+    }
+
+    return res.status(200).json(sales[0]);
+  } catch (error) {
+    console.error("Erro ao buscar vendas do dia:", error);
+    return res.status(500).json({
+      message: "Erro interno do servidor",
+    });
+  }
+};
+
+/**
+ * GET /api/invoices/sales/week
+ * Query params: merchantId, schoolId
+ * Retorna vendas agregadas por dia da semana atual
+ */
+export const getWeeklySales = async (req, res) => {
+  try {
+    // merchantId lido do token JWT
+    const merchantId = req.user?._id?.toString();
+    const { schoolId } = req.query;
+
+    if (!merchantId) {
+      return res.status(401).json({ message: "Não autenticado" });
+    }
+
+    if (!schoolId) {
+      return res.status(400).json({ message: "schoolId é obrigatório" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(schoolId)) {
+      return res.status(400).json({ message: "schoolId inválido" });
+    }
+
+    const merchant = await Merchant.findOne({
+      _id: new mongoose.Types.ObjectId(merchantId),
+      schoolId: new mongoose.Types.ObjectId(schoolId),
+    });
+    if (!merchant)
+      return res
+        .status(404)
+        .json({ message: "Mercador não encontrado para esta escola" });
+
+    const now = new Date();
+    const startOfWeek = new Date(now);
+    const day = now.getDay(); // 0 = Domingo, 1 = Segunda...
+    startOfWeek.setDate(now.getDate() - day + 1); // Ajusta para segunda
+    startOfWeek.setHours(0, 0, 0, 0);
+
+    const endOfWeek = new Date(startOfWeek);
+    endOfWeek.setDate(startOfWeek.getDate() + 6);
+    endOfWeek.setHours(23, 59, 59, 999);
+
+    const weeklySales = await Invoice.aggregate([
+      {
+        $match: {
+          merchantId: new mongoose.Types.ObjectId(merchantId),
+          status: "paid",
+          issuedAt: { $gte: startOfWeek, $lte: endOfWeek },
+        },
+      },
+      {
+        $group: {
+          _id: { $dayOfWeek: "$issuedAt" },
+          totalAmount: { $sum: "$totalAmount" },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
+
+    // MongoDB $dayOfWeek: 1=Domingo, 2=Segunda, 3=Terça, 4=Quarta, 5=Quinta, 6=Sexta, 7=Sábado
+    // O array começa em Segunda (mongoDay=2) e termina em Domingo (mongoDay=1)
+    const weekDays = [
+      { label: "Seg", mongoDay: 2 },
+      { label: "Ter", mongoDay: 3 },
+      { label: "Qua", mongoDay: 4 },
+      { label: "Qui", mongoDay: 5 },
+      { label: "Sex", mongoDay: 6 },
+      { label: "Sáb", mongoDay: 7 },
+      { label: "Dom", mongoDay: 1 },
+    ];
+    const result = weekDays.map(({ label, mongoDay }) => {
+      const dayData = weeklySales.find((d) => d._id === mongoDay);
+      return { month: label, amount: dayData ? dayData.totalAmount : 0 };
+    });
+
+    res.status(200).json(result);
+  } catch (err) {
+    console.error("Erro ao buscar vendas semanais:", err);
+    res.status(500).json({ message: "Erro interno do servidor" });
+  }
+};
+/**
+ * GET /api/invoices/sales/all
+ * Query params: merchantId, schoolId
+ * Retorna todas as facturas de um merchant na escola
+ */
+export const getAllSales = async (req, res) => {
+  try {
+    // merchantId lido do token JWT
+    const merchantId = req.user?._id?.toString();
+    const { schoolId } = req.query;
+
+    if (!merchantId) {
+      return res.status(401).json({ message: "Não autenticado" });
+    }
+
+    if (!schoolId) {
+      return res.status(400).json({ message: "schoolId é obrigatório" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(schoolId)) {
+      return res.status(400).json({ message: "schoolId inválido" });
+    }
+
+    //  Verificar se merchant existe na escola
+    const merchant = await Merchant.findOne({
+      _id: new mongoose.Types.ObjectId(merchantId),
+      schoolId: new mongoose.Types.ObjectId(schoolId),
+    });
+
+    if (!merchant) {
+      return res.status(404).json({
+        message: "Merchant não encontrado para esta escola",
+      });
+    }
+
+    //  Buscar todas as facturas
+    const invoices = await Invoice.find({
+      merchantId: new mongoose.Types.ObjectId(merchantId),
+      schoolId: new mongoose.Types.ObjectId(schoolId),
+    }).sort({ issuedAt: -1 }).lean(); // ordena do mais recente para o mais antigo
+
+    // Backwards compatibility para QRs legados pendentes
+    const invoicesWithQr = await Promise.all(
+      invoices.map(async (inv) => {
+        if (inv.status === "pending" && !inv.qrCode) {
+          try {
+            inv.qrCode = await QRCode.toDataURL(`PAY:${inv._id}`);
+          } catch (err) {
+            console.error("Erro ao gerar QR Code legado", err);
+          }
+        }
+        return inv;
+      })
+    );
+
+    //  Resposta
+    res.status(200).json({
+      totalInvoices: invoicesWithQr.length,
+      invoices: invoicesWithQr,
+    });
+  } catch (error) {
+    console.error("Erro ao buscar todas as vendas:", error);
+    res.status(500).json({
+      message: "Erro interno do servidor",
+    });
+  }
+};
+/**
+ * Controller para enviar PDF da invoice
+ */
+export const getInvoicePDF = async (req, res) => {
+  try {
+    const { invoiceNumber } = req.params;
+    // merchantId lido do token JWT para garantir que só o dono acede ao PDF
+    const merchantId = req.user?._id?.toString();
+
+    if (!merchantId) {
+      return res.status(401).json({ message: "Não autenticado" });
+    }
+
+    const pdfPath = getInvoicePDFPath(merchantId, invoiceNumber);
+
+    // envia o arquivo PDF
+    res.sendFile(pdfPath);
+  } catch (error) {
+    console.error(error);
+    res.status(404).json({ message: error.message || "PDF não encontrado" });
+  }
+};
+
+export const confirmInvoicePayment = async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    session.startTransaction();
+
+    const { invoiceId } = req.params;
+
+    // LOCK ATÓMICO: só transita se status for pending ou processing.
+    // Dois requests simultâneos: apenas UM consegue — o outro recebe null.
+    const invoice = await Invoice.findOneAndUpdate(
+      {
+        _id: invoiceId,
+        status: { $in: ["pending", "processing"] }, // bloqueia se já for "paid"
+      },
+      {
+        $set: {
+          status: "paid",
+          paidAt: new Date(),
+          isLocked: true,
+        },
+      },
+      { new: true, session },
+    );
+
+    if (!invoice) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(409).send({ message: "Invoice não encontrada ou já processada" });
+    }
+
+    // SOMENTE DIGITAL ENTRA NA WALLET
+    if (invoice.paymentMethod !== "CASH") {
+      await Wallet.findOneAndUpdate(
+        { ownerId: invoice.merchantId, ownerModel: "Merchant" },
+        {
+          $inc: {
+            balance: invoice.totalAmount,
+            totalCredits: invoice.totalAmount,
+          },
+          $set: { lastTransactionAt: new Date() },
+        },
+        { new: true, upsert: true, session },
+      );
+    }
+
+    // Atualizar transaction pendente correspondente
+    await Transaction.updateMany(
+      { receiverId: invoice.merchantId, amount: invoice.totalAmount, status: "pending" },
+      { $set: { status: "completed" } },
+      { session },
+    );
+
+    await session.commitTransaction();
+    session.endSession();
+
+    // GERAR PDF (fora da session — operação independente)
+    let finalPdfUrl = null;
+    try {
+      finalPdfUrl = await generateInvoicePDF(invoice);
+      await Invoice.findByIdAndUpdate(invoiceId, {
+        $set: { pdfUrl: finalPdfUrl, pdfFailed: false },
+      });
+      invoice.pdfUrl = finalPdfUrl; // para enviar no socket se der certo
+    } catch (err) {
+      await Invoice.findByIdAndUpdate(invoiceId, { $set: { pdfFailed: true } });
+    }
+
+    // DISPARAR NOTIFICAÇÕES E SOCKETS
+    try {
+      await createNotification(
+        invoice.merchantId,
+        "Merchant",
+        "Pagamento Confirmado",
+        `A fatura ${invoice.invoiceNumber} foi confirmada e paga com sucesso.`,
+        "transaction",
+        "high",
+        invoice._id,
+        "Invoice"
+      );
+
+      const io = getIO();
+      // Socket para atualizar UI em tempo real
+      io.to(invoice.merchantId.toString()).emit(SOCKET_EVENTS.MERCHANT_INVOICE_PAID, {
+        invoiceId: invoice._id,
+        invoiceNumber: invoice.invoiceNumber,
+        amount: invoice.totalAmount,
+      });
+      io.to(invoice.merchantId.toString()).emit(SOCKET_EVENTS.WALLET_UPDATED);
+    } catch (notificationErr) {
+      console.error("Erro ao enviar notificações de confirmação:", notificationErr);
+    }
+
+    res.send({
+      message: "Pagamento confirmado com sucesso",
+      invoice,
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    res.status(500).send({ message: error.message });
+  }
+};
+
+/**
+ * GET /api/invoice/:invoiceId
+ * Busca os detalhes públicos de uma invoice pelo ID (para leitura do QR Code)
+ */
+export const getInvoiceById = async (req, res) => {
+  try {
+    const { invoiceId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(invoiceId)) {
+      return res.status(400).json({ message: "ID de fatura inválido" });
+    }
+
+    const invoice = await Invoice.findById(invoiceId).populate("merchantId", "name");
+
+    if (!invoice) {
+      return res.status(404).json({ message: "Fatura não encontrada" });
+    }
+
+    res.status(200).json({ invoice });
+  } catch (error) {
+    console.error("Erro ao buscar detalhes da fatura:", error);
+    res.status(500).json({ message: "Erro interno do servidor" });
+  }
+};

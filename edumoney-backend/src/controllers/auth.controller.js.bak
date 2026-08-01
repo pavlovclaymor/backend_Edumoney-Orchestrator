@@ -1,0 +1,792 @@
+/**
+ * Auth Controller
+ * Agora delega toda a lógica de negócio para auth.service.js
+ * O controller apenas recebe req/res e passa para o service.
+ */
+
+import { writeAuditLog } from "../utils/auditLogger.js";
+import { createNotification } from "./notification.controller.js";
+import * as authService from "../services/auth.service.js";
+
+// Helper para extrair contexto de auditoria do req
+const getAuditContext = (req) => ({
+  ip: req.ip,
+  userAgent: req.headers["user-agent"]
+});
+
+// =========================================================
+// REGISTER - Registrar estudante
+// =========================================================
+export const register = async (req, res) => {
+  try {
+    const { name, processNumber, role, schoolId, classId, year } = req.body;
+
+    if (!name || !processNumber || !schoolId || !classId || !year) {
+      return res.status(400).send({
+        message: "name, processNumber, schoolId, classId e year são obrigatórios"
+      });
+    }
+
+    const result = await authService.registerStudent(
+      { name, processNumber, role, schoolId, classId, year },
+      getAuditContext(req)
+    );
+
+    await writeAuditLog({
+      userId: result.user._id,
+      userModel: "User",
+      action: "Estudante criado",
+      entity: "User",
+      entityId: result.user._id,
+      status: "success",
+      schoolId: result.user.schoolId,
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+      metadata: result.user.name
+    }).catch(() => {});
+
+    return res.status(201).send({
+      message: "Aluno criado com sucesso",
+      token: result.token,
+      student: result.student,
+    });
+  } catch (error) {
+    const status = error.status || 500;
+    const message = error.message || "Server error";
+    return res.status(status).send({ message });
+  }
+};
+
+/**
+ * Login user or school or merchant
+ * Body: {processNumber, password}
+ */
+export const login = async (req, res) => {
+  //  Impede cache (resolver "waiting...")
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate, proxy-revalidate",
+  );
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Surrogate-Control", "no-store");
+
+  try {
+    const { nif = "", processNumber, password, schoolId = "", email = "" } = req.body;
+
+    // ================================
+    //  LOGIN POR NÚMERO DE PROCESSO
+    // ================================
+    if (processNumber && schoolId) {
+      const user = await User.findOne({ processNumber, schoolId })
+        .populate("schoolId", "_id nif name")
+        .populate("walletId", "balance")
+        .select("+password +pin");
+
+      if (!user) {
+        await writeAuditLog({
+      userId: user._id, userModel: "User", action: "STUDENT_FAILED_LOGIN",
+      entity: "User", entityId: user._id, status: "failed",
+      schoolId: user.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: user.name
+    }).catch(() => {});
+     return res.status(401).send({ message: "Credenciais invalidas" });
+      }
+       
+
+      // ================================
+      // Verifica a Senha
+      // ================================
+      const isMatch = await user.matchPassword(password);
+      if (!isMatch){
+      await writeAuditLog({
+      userId: user._id, userModel: "User", action: "STUDENT_FAILED_LOGIN",
+      entity: "User", entityId: user._id, status: "failed",
+      schoolId: user.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: user.name
+    }).catch(() => {});
+
+        return res.status(400).send({ message: "erro nas credenciais" });
+      } 
+
+      // converte para objeto plano, garante serialização completa
+      const userObj = user.toObject();
+      // Normalize schoolId: when populated it may be an object {_id, nif, name}
+      userObj.schoolId = userObj.schoolId?._id ?? userObj.schoolId;
+      userObj.role = "student";
+      userObj.pinConfigured = !!user.pin;
+      delete userObj.pin;
+      delete userObj.password;
+      
+      const token = signToken(userObj._id);
+
+       await writeAuditLog({
+      userId: user._id, userModel: "User", action: "STUDENT_LOGIN_SUCCESS",
+      entity: "User", entityId: user._id, status: "success",
+      schoolId: user.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: user.name
+    }).catch(() => {});
+
+      return res.status(200).send({
+        message: "Login successful",
+        token,
+        userData: userObj,
+      });
+    }
+
+    // ================================
+    //  LOGIN POR NIF (ESCOLA OU MERCHANT)
+    // ================================
+    if (nif && password) {
+      // Escola
+      const school = await School.findOne({ nif }).select("+password");
+      if (school) {
+        const match = await school.matchPassword(password);
+        if (!match){
+          await writeAuditLog({
+            userId: school._id,
+            userModel: "School",
+            action: "SCHOOL_LOGIN_FAILED",
+            entity: "LOGIN",
+            entityId: school._id,
+            status: "failed",
+            schoolId: school._id,
+            ip: req.ip,
+            userAgent: req.headers["user-agent"],
+            metadata: { reason: "Invalid password" },
+          }).catch(() => {});
+           return res.status(401).send({ message: "Invalid credentials" });
+        }  
+
+        const token = signToken(school._id);
+
+        await writeAuditLog({
+            userId: school._id,
+            userModel: "School",
+            action: "SCHOOL_LOGIN_SUCCESS",
+            entity: "LOGIN",
+            entityId: school._id,
+            status: "success",
+            schoolId: school._id,
+            ip: req.ip,
+            userAgent: req.headers["user-agent"],
+            metadata: school.name,
+          }).catch(() => {});
+        return res.status(200).send({
+          message: "Login successful",
+          token,
+          userData: school,
+        })
+      
+    }
+
+      // Merchant
+      const merchant = await Merchant.findOne({ nif })
+        .populate("schoolId")
+        .populate("walletId", "balance")
+        .select("+password");
+
+      if (merchant) {
+        const match = await merchant.matchPassword(password);
+        if (!match){
+
+           await writeAuditLog({
+            userId: merchant._id,
+            userModel: "Merchant",
+            action: "Mercaht_LOGIN_FAILED",
+            entity: "LOGIN",
+            entityId: merchant._id,
+            status: "failed",
+            schoolId: merchant.schoolId,
+            ip: req.ip,
+            userAgent: req.headers["user-agent"],
+            metadata: {reason: "INVALID CREDENTIALS"},
+          }).catch(() => {});
+
+            return res.status(401).send({ message: "Invalid credentials" });
+        }
+        
+
+        const token = signToken(merchant._id);
+
+        
+           await writeAuditLog({
+            userId: merchant._id,
+            userModel: "Merchant",
+            action: "Mercaht_LOGIN_SUCCESS",
+            entity: "LOGIN",
+            entityId: merchant._id,
+            status: "success",
+            schoolId: merchant.schoolId,
+            ip: req.ip,
+            userAgent: req.headers["user-agent"],
+            metadata: merchant.name,
+          }).catch(() => {});
+
+        return res.status(200).send({
+          message: "Login successful",
+          token,
+          userData: merchant,
+        });
+      }
+
+      // Nenhum encontrado
+      return res.status(404).send({ message: "NIF não encontrado" });
+    }
+
+    // ================================
+    //  LOGIN POR EMAIL
+    // ================================
+    if (email && password) {
+      // 1. Tenta Estudante
+      const user = await User.findOne({ email, email_verified: true })
+        .populate("schoolId", "_id nif name")
+        .populate("walletId", "balance")
+        .select("+password +pin");
+
+      if (user) {
+        const isMatch = await user.matchPassword(password);
+        if (!isMatch){
+           await writeAuditLog({
+      userId: user._id, userModel: "User", action: "STUDENT_FAILED_LOGIN",
+      entity: "User", entityId: user._id, status: "failed",
+      schoolId: user.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: { reason: "INVALID CREDENTIALS"}
+    }).catch(() => {});
+           return res.status(400).send({ message: "Email ou Senha incorretas" });
+        }
+
+        const userObj = user.toObject();
+        // Normalize schoolId: ensure we always expose the ObjectId string
+        userObj.schoolId = userObj.schoolId?._id ?? userObj.schoolId;
+        userObj.role = "student";
+        userObj.pinConfigured = !!user.pin;
+        delete userObj.pin;
+        delete userObj.password;
+
+        const token = signToken(userObj._id);
+         await writeAuditLog({
+      userId: user._id, userModel: "User", action: "STUDENT_LOGIN_SUCCESS",
+      entity: "User", entityId: user._id, status: "success",
+      schoolId: user.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: user.name
+    }).catch(() => {});
+
+        return res.status(200).send({
+          message: "Login successful",
+          token,
+          userData: userObj,
+        });
+      }
+
+      // 2. Tenta Escola
+      const school = await School.findOne({ email }).select("+password");
+      if (school) {
+        const isMatch = await school.matchPassword(password);
+        if (!isMatch) return res.status(400).send({ message: "Senha incorreta" });
+
+        const token = signToken(school._id);
+
+        return res.status(200).send({
+          message: "Login successful",
+          token,
+          userData: school,
+        });
+      }
+
+      // 3. Tenta Merchant
+      const merchant = await Merchant.findOne({ email })
+        .populate("schoolId")
+        .populate("walletId", "balance")
+        .select("+password");
+
+      if (merchant) {
+        const isMatch = await merchant.matchPassword(password);
+        if (!isMatch){
+         
+          return res.status(400).send({ message: "Senha incorreta" });
+        }
+
+        const token = signToken(merchant._id);
+
+        return res.status(200).send({
+          message: "Login successful",
+          token,
+          userData: merchant,
+        });
+      }
+
+      return res.status(401).send({ message: "Email não encontrado ou não verificado" });
+    }
+
+    // ================================
+    //  REQUEST INVÁLIDA
+    // ================================
+    return res.status(400).send({
+      message: "Verifique o NIF, número de processo ou password",
+    });
+} catch (error) {
+    console.log(error.message)
+    
+    return res.status(500).send({
+      message: "Server error",
+      error: error.message,
+    });
+  }
+}
+
+export const getSudentsBySchool = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+
+    const schoolExists = await School.findById(schoolId);
+    if (!schoolExists)
+      return res.status(404).json({ message: "Escola não encontrada" });
+
+    const classes = await Class.find({ schoolId });
+    const students = await User.find({ schoolId })
+      .populate("walletId", "balance")
+      .select("-password");
+
+    // Retorna tudo dentro de um objeto
+    res.status(200).json({
+      students,
+      classes,
+    });
+  } catch (error) {
+    console.error("Erro ao listar estudantes: " + error);
+    res.status(500).json({ message: "Erro interno no servidor" });
+  }
+};
+
+export const getStudentProfile = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (String(req.user?._id) !== String(id)) {
+      return res.status(403).send({ message: "Não autorizado a acessar este perfil" });
+    }
+
+    const userData = await buildStudentUserData(id);
+
+    if (!userData) {
+      return res.status(404).send({ message: "Estudante nao encontrado" });
+    }
+
+    return res.status(200).send({
+      message: "Perfil carregado com sucesso",
+      userData,
+    });
+  } catch (error) {
+    console.error("Erro ao carregar perfil do estudante:", error);
+    return res.status(500).send({ message: "Erro interno no servidor" });
+  }
+};
+
+export const updateStudent = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, processNumber, schoolId, ...otherFields } = req.body;
+
+    const student = await User.findById(id);
+    if (!student)
+      return res.status(404).send({ message: "Estudante nao encontrado" });
+
+    // Impede alterar name e processNumber
+    if (name || processNumber) {
+      return res.status(400).send({ message: "Não é permitido alterar Nome ou Número de Processo." });
+    }
+
+    if (schoolId) {
+      const schoolExists = await School.findById(schoolId);
+      if (!schoolExists) {
+        return res
+          .status(404)
+          .send({ message: "A escola informada nao existe" });
+      }
+      student.schoolId = schoolId;
+    }
+
+    // Permitir alteração de outros campos, exceto os controlados pelo sistema
+    const forbiddenFields = ['role', 'status', 'walletId', 'password', 'pin', '_id', 'email_verified'];
+    Object.keys(otherFields).forEach((key) => {
+      if (!forbiddenFields.includes(key)) {
+        student[key] = otherFields[key];
+      }
+    });
+
+    await student.save();
+
+    await createNotification(
+      student._id,
+      "User",
+      "Perfil Atualizado",
+      "As informações do seu perfil foram atualizadas com sucesso.",
+      "security",
+      "low"
+    );
+
+     await writeAuditLog({
+      userId: req.user._id, userModel: "User", action: "STUDENT_UPDATED",
+      entity: "User", entityId: student._id, status: "success",
+      schoolId: student.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: { updatedFields: Object.keys(req.body) },
+    }).catch(() => {});
+
+    const userData = await buildStudentUserData(student._id);
+
+    res.status(200).send({
+      message: "usuario actualizado com sucesso",
+      userData,
+      student: userData,
+    });
+  } catch (error) {
+    console.log("Erro ao actualizar estudantes: " + error);
+
+    res.status(500).send({ message: "Erro interno no servidor" });
+  }
+};
+
+export const changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    /* ===========================
+       VALIDAÇÃO BÁSICA
+    =========================== */
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        message: "Preencha todos os campos",
+      });
+    }
+
+    /* ===========================
+       VALIDAÇÃO DE SEGURANÇA
+    =========================== */
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        message: "A senha deve ter pelo menos 8 caracteres",
+      });
+    }
+
+    if (!/[A-Z]/.test(newPassword)) {
+      return res.status(400).json({
+        message: "Inclua pelo menos 1 letra maiúscula",
+      });
+    }
+
+    if (!/[0-9]/.test(newPassword)) {
+      return res.status(400).json({
+        message: "Inclua pelo menos 1 número",
+      });
+    }
+
+    /* ===========================
+       BUSCAR USUÁRIO
+    =========================== */
+    const user = await User.findById(req.user._id).select("+password");
+
+    if (!user) {
+      return res.status(404).json({
+        message: "Usuário não encontrado",
+      });
+    }
+
+    /* ===========================
+       VALIDAR SENHA ATUAL
+    =========================== */
+    const isMatch = await user.matchPassword(currentPassword);
+
+    if (!isMatch) {
+      await writeAuditLog({
+        userId: user._id, userModel: "User", action: "PASSWORD_CHANGE_FAILED",
+        entity: "User", entityId: user._id, status: "failed",
+        schoolId: user.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+        metadata: { reason: "Invalid current password" },
+      }).catch(() => {});
+      return res.status(400).json({
+        message: "Senha atual incorreta",
+      });
+    }
+
+    /* ===========================
+       EVITAR REUTILIZAÇÃO
+    =========================== */
+    const isSamePassword = await user.matchPassword(newPassword);
+
+    if (isSamePassword) {
+      return res.status(400).json({
+        message: "A nova senha deve ser diferente da atual",
+      });
+    }
+
+    /* ===========================
+       ATUALIZAR SENHA
+    =========================== */
+    user.password = newPassword;
+
+    // redundante (já tenho no pre-save, mas útil para clareza)
+    user.passwordChangedAt = new Date();
+
+    /* ===========================
+       LOG DE SEGURANÇA (PRO)
+    =========================== */
+    user.securityLogs.push({
+      action: "PASSWORD_CHANGED",
+      ip: req.ip,
+    })
+
+    /* ===========================
+       SALVAR E NOTIFICAR
+    =========================== */
+    await user.save();
+
+    await writeAuditLog({
+      userId: user._id, userModel: "User", action: "USER_PASSWORD_CHANGED",
+      entity: "User", entityId: user._id, status: "success",
+      schoolId: user.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+    }).catch(() => {});
+
+
+    await createNotification(
+      user._id,
+      "User",
+      "Senha Atualizada",
+      "A sua senha de acesso foi alterada com sucesso.",
+      "security",
+      "normal"
+    );
+
+    const userData = await buildStudentUserData(user._id);
+
+    return res.status(200).json({
+      message: "Senha atualizada com sucesso",
+      userData,
+    });
+  } catch (error) {
+    console.error("Erro ao alterar senha:", error);
+
+    return res.status(500).json({
+      message: "Erro interno ao alterar senha",
+    });
+  }
+};
+
+export const setPin = async (req, res) => {
+  try {
+    const { pin } = req.body;
+
+
+
+    //  Validação básica
+    if (!pin || !/^\d{4}$/.test(pin)) {
+      return res.status(400).json({
+        message: "O PIN deve ter exatamente 4 dígitos numéricos",
+      });
+    }
+
+    //Buscar usuário
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({
+        message: "Usuário não encontrado",
+      });
+    }
+
+    //  Evitar reutilização do PIN
+    if (user.pin) {
+      const isSame = await bcrypt.compare(pin, user.pin);
+      if (isSame) {
+            await writeAuditLog({
+      userId: user._id, userModel: "User", action: "USER_PIN_SET_FAILED_REUSE",
+      entity: "User", entityId: user._id, status: "failed",
+      schoolId: user.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+    }).catch(() => {});
+        return res.status(400).json({
+          message: "O novo PIN deve ser diferente do anterior",
+        });
+      }
+    }
+
+    //Hash do PIN
+    const salt = await bcrypt.genSalt(10);
+    user.pin = await bcrypt.hash(pin, salt);
+
+    // Se o usuário estiver inativo e for a primeira vez que define o PIN, torná-lo ativo
+    let wasActivated = false;
+    if (user.status === "inativo") {
+      user.status = "ativo";
+      wasActivated = true;
+    }
+
+    // Log de segurança
+    user.securityLogs.push({
+      action: "PIN_SET",
+      ip: req.ip,
+    });
+
+    await user.save();
+    await writeAuditLog({
+      userId: user._id, userModel: "User", action: "USER_PIN_SET",
+      entity: "User", entityId: user._id, status: "success",
+      schoolId: user.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+    }).catch(() => {});
+    
+    await createNotification(
+      user._id,
+      "User",
+      "PIN Configurado",
+      "Seu PIN foi configurado com sucesso.",
+      "security",
+      "normal"
+    );
+
+
+    const userData = await buildStudentUserData(user._id);
+
+    return res.status(200).json({
+      message: "PIN configurado com sucesso",
+      status: user.status,
+      wasActivated,
+      userData,
+      user: userData,
+    });
+  } catch (error) {
+    console.error("Erro ao configurar PIN:", error);
+    return res.status(500).json({
+      message: "Erro interno ao configurar PIN",
+    });
+  }
+};
+
+/* =========================================================
+   EMAIL VERIFICATION E RECUPERAÇÃO DE SENHA
+========================================================= */
+
+export const requestEmailVerification = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: "Email é obrigatório" });
+
+    // Verifica se já existe outro usuário com esse email (verificado)
+    const existingUser = await User.findOne({ email, email_verified: true });
+    if (existingUser && existingUser._id.toString() !== req.user._id.toString()) {
+      return res.status(400).json({ message: "Este email já está em uso" });
+    }
+
+    const user = await User.findById(req.user._id);
+    if (!user) return res.status(404).json({ message: "Usuário não encontrado" });
+
+    // Gera código de 6 dígitos
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Gera hash do código e define expiração de 10 min
+    const hashedCode = crypto.createHash('sha256').update(code).digest('hex');
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    user.pending_email = email;
+    user.verification_code = hashedCode;
+    user.code_expires_at = expiresAt;
+    await user.save();
+
+    await sendVerificationEmail(email, code);
+
+    return res.status(200).json({ message: "Código enviado para o seu email" });
+  } catch (error) {
+    console.error("Erro em requestEmailVerification:", error);
+    return res.status(500).json({ message: "Erro ao enviar email de verificação" });
+  }
+};
+
+export const verifyEmail = async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ message: "Código é obrigatório" });
+
+    const user = await User.findById(req.user._id);
+    if (!user || !user.pending_email) {
+      return res.status(400).json({ message: "Nenhuma solicitação pendente" });
+    }
+
+    if (user.code_expires_at < new Date()) {
+      return res.status(400).json({ message: "Código expirado" });
+    }
+
+    const hashedCode = crypto.createHash('sha256').update(code).digest('hex');
+    if (user.verification_code !== hashedCode) {
+      return res.status(400).json({ message: "Código inválido" });
+    }
+
+    user.email = user.pending_email;
+    user.email_verified = true;
+    user.pending_email = null;
+    user.verification_code = undefined;
+    user.code_expires_at = undefined;
+    await user.save();
+
+    return res.status(200).json({ message: "Email verificado com sucesso" });
+  } catch (error) {
+    console.error("Erro em verifyEmail:", error);
+    return res.status(500).json({ message: "Erro ao verificar email" });
+  }
+};
+
+export const forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: "Email é obrigatório" });
+
+    const user = await User.findOne({ email, email_verified: true });
+    if (!user) {
+      return res.status(404).json({ message: "Usuário não encontrado ou email não verificado" });
+    }
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const hashedCode = crypto.createHash('sha256').update(code).digest('hex');
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+    user.verification_code = hashedCode;
+    user.code_expires_at = expiresAt;
+    await user.save();
+
+    await sendPasswordResetEmail(email, code);
+
+    return res.status(200).json({ message: "Código enviado para o seu email" });
+  } catch (error) {
+    console.error("Erro em forgotPassword:", error);
+    return res.status(500).json({ message: "Erro ao solicitar recuperação de senha" });
+  }
+};
+
+export const resetPassword = async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ message: "Email, código e nova senha são obrigatórios" });
+    }
+
+    const user = await User.findOne({ email, email_verified: true });
+    if (!user) {
+      return res.status(404).json({ message: "Usuário não encontrado" });
+    }
+
+    if (!user.verification_code || user.code_expires_at < new Date()) {
+      return res.status(400).json({ message: "Código inválido ou expirado" });
+    }
+
+    const hashedCode = crypto.createHash('sha256').update(code).digest('hex');
+    if (user.verification_code !== hashedCode) {
+      return res.status(400).json({ message: "Código inválido" });
+    }
+
+    user.password = newPassword;
+    user.verification_code = undefined;
+    user.code_expires_at = undefined;
+    await user.save();
+
+    return res.status(200).json({ message: "Senha redefinida com sucesso" });
+  } catch (error) {
+    console.error("Erro em resetPassword:", error);
+    return res.status(500).json({ message: "Erro ao redefinir senha" });
+  }
+};

@@ -1,0 +1,460 @@
+import School from "../models/school.model.js";
+import Wallet from "../models/wallet.js";
+import Class from "../models/class.model.js";
+import Merchant from "../models/merchant.model.js";
+
+// Criar escola
+export const createSchool = async (req, res) => {
+  try {
+    const { name, nif, address, password } = req.body;
+
+    // validações
+    if (!name || !nif || !address || !password) {
+      return res.status(400).send({
+        message: "Preencha todos os campos obrigatórios",
+      });
+    }
+
+    if (!/^\d{9}$/.test(nif)) {
+      return res.status(400).send({
+        message: "O NIF deve conter exatamente 9 dígitos",
+      });
+    }
+
+    // verificar duplicação
+    const existingSchool = await School.findOne({
+      $or: [{ name }, { nif }],
+    });
+
+    if (existingSchool) {
+      if (existingSchool.nif === nif)
+        return res.status(400).send({
+          message: "Já existe uma escola cadastrada com este NIF",
+        });
+
+      if (existingSchool.name === name)
+        return res.status(400).send({
+          message: "Já existe uma escola cadastrada com este nome",
+        });
+
+      return res.status(400).send({
+        message: "Escola já cadastrada",
+      });
+    }
+
+    // cria escola
+    const school = await School.create({
+      name,
+      nif,
+      address,
+      password,
+    });
+
+    // cria wallet GLOBAL
+    const wallet = await Wallet.create({
+      ownerId: school._id,
+      ownerModel: "School",
+      balance: 0,
+    });
+
+    school.walletId = wallet._id;
+    await school.save();
+
+    return res.status(201).send({
+      message: "Escola e carteira criadas com sucesso!",
+      school,
+    });
+  } catch (error) {
+    console.error("Erro ao criar escola:", error);
+
+    if (error.code === 11000) {
+      const duplicatedField = Object.keys(error.keyValue)[0];
+
+      return res.status(400).send({
+        message: `Já existe uma escola cadastrada com este ${duplicatedField}`,
+      });
+    }
+
+    if (error.name === "ValidationError") {
+      return res.status(400).send({
+        message: error.message,
+      });
+    }
+
+    return res.status(500).send({
+      message: "Erro interno ao criar escola",
+    });
+  }
+};
+
+//Actualizar dados da Escola
+export const UpdateSchool = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+    const userId = req.user?._id;
+
+    // valida id
+    if (!schoolId) {
+      return res.status(400).send({
+        message: "Id da escola não digitado",
+      });
+    }
+
+    // segurança
+    if (String(schoolId) !== String(userId)) {
+      return res.status(403).send({
+        message: "Não autorizado",
+      });
+    }
+
+    const { phone, email, description, website } = req.body;
+
+    // montar objeto dinâmico (performance)
+    const updateData = {};
+
+    if (phone) updateData.phone = phone;
+    if (email) updateData.email = email;
+    if (description) updateData.description = description;
+    if (website) updateData.website = website;
+
+    // nenhum campo enviado
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).send({
+        message: "Digite pelo menos um campo para atualizar",
+      });
+    }
+
+    // update direto (mais performático)
+    const updatedSchool = await School.findByIdAndUpdate(
+      schoolId,
+      { $set: updateData },
+      { new: true, runValidators: true },
+    );
+
+    if (!updatedSchool) {
+      return res.status(404).send({
+        message: "Escola não encontrada",
+      });
+    }
+
+    return res.status(200).send({
+      message: "Atualizado com sucesso",
+      school: updatedSchool,
+    });
+  } catch (error) {
+    console.error("Erro ao atualizar escola:", error);
+
+    return res.status(500).send({
+      message: "Erro interno ao atualizar escola",
+    });
+  }
+};
+
+// pegar uma escola
+export const getOneSchool = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+
+    const school = await School.findById(schoolId).populate("walletId");
+
+    if (!school)
+      return res.status(404).send({
+        message: "Escola não encontrada",
+      });
+
+    return res.status(200).send({
+      school,
+      message: "Sucesso ao pegar escola",
+    });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+// listar escolas
+export const getAllSchools = async (req, res) => {
+  try {
+    const schools = await School.find();
+
+    return res.status(200).send({
+      schools,
+      message: "Sucesso",
+    });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+// pegar wallet da escola
+export const getSchoolWallet = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+
+    const wallet = await Wallet.findOne({
+      ownerId: schoolId,
+      ownerModel: "School",
+    });
+
+    if (!wallet)
+      return res.status(404).send({
+        message: "Carteira da escola não encontrada",
+      });
+
+    return res.status(200).send(wallet);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+// listar turmas da escola
+export const getAllClasses = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+
+    const classes = await Class.find({ schoolId });
+
+    if (!classes.length)
+      return res.status(404).send({
+        message: "Nenhuma turma encontrada para esta escola",
+      });
+
+    res.status(200).send(classes);
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+// listar comerciantes da escola
+export const getAllMerchantForSchool = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+
+    const merchant = await Merchant.find({ schoolId });
+
+    if (!merchant.length)
+      return res.status(404).send({
+        message: "Nenhum comerciante encontrado",
+      });
+
+    res.status(200).send({
+      merchant,
+      message: "Sucesso",
+    });
+  } catch (err) {
+    res.status(500).send({ message: err.message });
+  }
+};
+
+// Adicionar folhas impressas a uma escola
+export const addSheetsPrint = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+    const { quantity } = req.body;
+
+    if (!quantity || quantity <= 0) {
+      return res.status(400).send({
+        message: "Informe uma quantidade válida de folhas para adicionar",
+      });
+    }
+
+    // Buscar escola
+    const school = await School.findById(schoolId);
+    if (!school) {
+      return res.status(404).send({
+        message: "Escola não encontrada",
+      });
+    }
+
+    // Atualizar folhas impressas
+    school.sheetsPrinted += quantity;
+    await school.save();
+
+    return res.status(200).send({
+      message: `${quantity} folhas adicionadas com sucesso`,
+      sheetsPrinted: school.sheetsPrinted,
+    });
+  } catch (err) {
+    console.error("Erro ao adicionar folhas impressas:", err);
+    res.status(500).send({
+      message: "Erro interno ao atualizar folhas impressas",
+    });
+  }
+};
+
+export const getSheetsPrinted = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+
+    const school = await School.findById(schoolId, "sheetsPrinted sheetsSold"); // só traz sheetsPrinted
+    if (!school) {
+      return res.status(404).send({
+        message: "Escola não encontrada",
+      });
+    }
+
+    return res.status(200).send({
+      sheetsPrinted: school.sheetsPrinted,
+      sheetsSold: school.sheetsSold,
+    });
+  } catch (err) {
+    console.error("Erro ao buscar folhas impressas:", err);
+    res.status(500).send({
+      message: "Erro interno ao buscar folhas impressas",
+    });
+  }
+};
+
+// Atualizar taxa de saque (feeRate)
+export const updateFeeRate = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+    const { feeRate } = req.body;
+    const userId = req.user?._id;
+
+    // Segurança
+    if (String(schoolId) !== String(userId)) {
+      return res.status(403).send({
+        message: "Nao autorizado",
+      });
+    }
+
+    // Validacao
+    if (feeRate === undefined || feeRate === null) {
+      return res.status(400).send({
+        message: "feeRate e obrigatorio",
+      });
+    }
+
+    const feeValue = parseFloat(feeRate);
+
+    if (isNaN(feeValue) || feeValue < 0 || feeValue > 1) {
+      return res.status(400).send({
+        message: "feeRate deve ser um numero entre 0 e 1 (ex: 0.025 para 2.5%)",
+      });
+    }
+
+    const school = await School.findByIdAndUpdate(
+      schoolId,
+      { $set: { feeRate: feeValue } },
+      { new: true, runValidators: true }
+    );
+
+    if (!school) {
+      return res.status(404).send({
+        message: "Escola nao encontrada",
+      });
+    }
+
+    return res.status(200).send({
+      message: "Taxa de saque atualizada com sucesso",
+      feeRate: school.feeRate,
+    });
+  } catch (err) {
+    console.error("Erro ao atualizar taxa de saque:", err);
+    return res.status(500).send({
+      message: "Erro interno ao atualizar taxa de saque",
+    });
+  }
+};
+
+// Obter taxa de saque atual
+export const getFeeRate = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+
+    const school = await School.findById(schoolId, "feeRate");
+
+    if (!school) {
+      return res.status(404).send({
+        message: "Escola nao encontrada",
+      });
+    }
+
+    return res.status(200).send({
+      feeRate: school.feeRate,
+    });
+  } catch (err) {
+    console.error("Erro ao buscar taxa de saque:", err);
+    return res.status(500).send({
+      message: "Erro interno ao buscar taxa de saque",
+    });
+  }
+};
+
+export const changePassword = async (req, res) => {
+  try {
+    const { schoolId } = req.params;
+    const { currentPassword, newPassword } = req.body;
+
+    //  Validação básica
+    if (!currentPassword || !newPassword) {
+      return res.status(400).send({
+        message: "Preencha todos os campos",
+      });
+    }
+
+    //  Validação forte da senha
+    if (newPassword.length < 6) {
+      return res.status(400).send({
+        message: "A nova senha deve ter pelo menos 6 caracteres",
+      });
+    }
+
+    if (!/[A-Z]/.test(newPassword)) {
+      return res.status(400).send({
+        message: "Inclua pelo menos 1 letra maiúscula",
+      });
+    }
+
+    if (!/[0-9]/.test(newPassword)) {
+      return res.status(400).send({
+        message: "Inclua pelo menos 1 número",
+      });
+    }
+
+    // 🔎 Buscar com senha
+    const school = await School.findById(schoolId).select("+password");
+
+    if (!school) {
+      return res.status(404).send({
+        message: "Escola não encontrada",
+      });
+    }
+
+    // 🔑 Comparar senha atual
+    const isMatch = await school.matchPassword(currentPassword);
+
+    if (!isMatch) {
+      return res.status(400).send({
+        message: "Senha atual incorreta",
+      });
+    }
+
+    // 🚫 Evitar senha igual
+    const isSamePassword = await school.matchPassword(newPassword);
+    if (isSamePassword) {
+      return res.status(400).send({
+        message: "A nova senha deve ser diferente da atual",
+      });
+    }
+
+    // 🔄 Atualizar senha (hash automático via pre-save)
+    school.password = newPassword;
+
+    // 🗓 Auditoria simples
+    school.passwordChangedAt = new Date();
+
+    await school.save();
+
+    return res.status(200).send({
+      message: "Senha alterada com sucesso",
+    });
+
+  } catch (err) {
+    console.error("Erro ao alterar senha:", err);
+
+    return res.status(500).send({
+      message: "Erro interno ao alterar senha",
+    });
+  }
+};

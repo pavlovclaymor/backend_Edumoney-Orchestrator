@@ -1,0 +1,56 @@
+@baseUrl = http://localhost:3000
+@token = 
+###Create user
+POST {{baseUrl}}/api/users/login
+Content-Type: application/json
+
+{
+      "nif": "",
+      "processNumber": "70890",
+       "password": "12345678" ,
+       "schoolId": "69d51f74fb885a449a53bd4a"
+}
+
+
+# eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjY5MTVkZWUwNDM4Mjc5YzA5MjVhNjkwNCIsImlhdCI6MTc2MzA0MDk5MywiZXhwIjoxNzYzNjQ1NzkzfQ.dM8arIfj8dFjFNVQ44jNUqaxRZ-IkcN4H3nlzt5M_as
+
+# 68faab1262612cd3c99fa668
+# wallet 68faab1362612cd3c99fa66e
+### Login User
+GET  {{baseUrl}}/api/transaction/user/69a819a01949261f67f37449
+Content-Type: application/json
+
+### Add Saldo
+Post {{baseUrl}}/api/wallet/add-balance
+Content-Type: application/json
+
+{
+  "userId": "69adb96a7b521ff24b439bcb",
+  "amount": 500
+}  
+
+
+### Request
+Post {{baseUrl}}/api/recharge/request
+Content-Type: application/json
+
+{
+  "walletId": "6915e488eb616a4715d47999",
+  "schoolId": "68faab1262612cd3c99fa668",
+  "amount": 5000
+}
+
+### confirm Rupe
+Post {{baseUrl}}/api/recharge/callback
+Content-Type: application/json
+
+{
+  "rupeReference": "RUPE-7676626903"
+}
+
+### Pegar Transaction
+GET {{baseUrl}}/api/pegar
+Content-Type: application/json
+
+
+

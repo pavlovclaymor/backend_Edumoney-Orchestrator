@@ -1,0 +1,747 @@
+import mongoose from "mongoose";
+
+import { processTransaction } from "../services/finance.service.js";
+import Wallet from "../models/wallet.js";
+import School from "../models/school.model.js";
+import Rupe from "../models/rupe.model.js";
+import User from "../models/user.model.js";
+import bcrypt from "bcrypt";
+import Transaction from "../models/transaction.js";
+import { getIO } from "../services/socket.service.js";
+
+import ServicePrice from "../models/servicePrice.model.js";
+import Merchant from "../models/merchant.model.js";
+import { createNotification } from "./notification.controller.js";
+import Invoice from "../models/invoice.model.js";
+import { generateInvoicePDF } from "../services/pdf.service.js";
+import crypto from "crypto";
+import { writeAuditLog } from "../utils/auditLogger.js";
+
+
+import { emitPaymentEvents } from "../utils/emitPaymentEvents.js";
+
+const generateReference = (prefix = "TX") => {
+  return `${prefix}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+};
+
+//Para um padrao dos servicos que afectam directamente o fornt da escola defini um objecto...
+const SERVICE_TYPE = {
+  CERTIFICATE: "CERTIFICADO",
+  EXAM_SHEET: "FOLHA_PROVA",
+};
+
+//Uma funcao para me faciliar a identifcar os erros http masi so para desenvlvimento nao sera util em producao...
+const buildHttpError = (status, message) => {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+};
+
+//A funcao que adiciona as meticas de servido da escola do tipo identifica o o tipo de servico e incremetna ou decrementa com base nos metodos criados no seu model...
+const applySchoolServiceMetrics = (school, rupe) => {
+  school.requestDocument(rupe.quantidade);
+
+  if (rupe.tipoServico === SERVICE_TYPE.CERTIFICATE) {
+    school.incrementCertificateRequests(rupe.quantidade);
+  }
+
+  if (rupe.tipoServico === SERVICE_TYPE.EXAM_SHEET) {
+    school.sellSheets(rupe.quantidade);
+  }
+};
+
+export const makePayment = async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    session.startTransaction();
+
+    const { rupeReference, pin } = req.body;
+    const studentId = req.user?._id;
+
+    if (!studentId || !rupeReference || !pin)
+      throw buildHttpError(400, "Dados incompletos");
+
+    const student = await User.findById(studentId)
+      .select("+pin")
+      .session(session);
+
+    if (!student) throw buildHttpError(404, "Estudante não encontrado");
+
+    const isMatch = await bcrypt.compare(pin, student.pin);
+    if (!isMatch) throw buildHttpError(401, "PIN incorreto");
+
+    // LOCK ATÓMICO: muda status pending→processing num único opão atómica
+    // Previne race condition: se dois requests chegarem simultâneamente,
+    // apenas UM consegue a transição — o outro recebe null e aborta.
+    const invoice = await Invoice.findOneAndUpdate(
+      { rupeReference, status: "pending" },
+      { $set: { status: "processing" } },
+      { new: true, session },
+    );
+
+    if (!invoice)
+      throw buildHttpError(409, "Invoice não encontrada, já paga ou em processamento");
+
+    const wallet = await Wallet.findOne({
+      ownerId: studentId,
+      ownerModel: "User",
+    }).session(session);
+
+    if (!wallet) throw buildHttpError(404, "Carteira não encontrada");
+
+    if (wallet.balance < invoice.totalAmount)
+      throw buildHttpError(400, "Saldo insuficiente");
+
+    wallet.debit(invoice.totalAmount);
+    await wallet.save({ session });
+
+    const merchantWallet = await Wallet.findOne({
+      ownerId: invoice.merchantId,
+      ownerModel: "Merchant",
+    }).session(session);
+
+    if (merchantWallet) {
+      merchantWallet.credit(invoice.totalAmount);
+      await merchantWallet.save({ session });
+    }
+
+    // Finalizar invoice após operações financeiras confirmadas
+    invoice.status = "paid";
+    invoice.paidAt = new Date();
+    invoice.isLocked = true;
+    invoice.studentId = studentId;
+    invoice.clientName = student.name;
+    invoice.clientEmail = student.email;
+
+    await invoice.save({ session });
+
+    const transaction = await Transaction.create(
+      [
+        {
+          senderId: studentId,
+          senderType: "User",
+          receiverId: invoice.merchantId,
+          receiverType: "Merchant",
+          amount: invoice.totalAmount,
+          type: "payment",
+          status: "completed",
+          description: `Pagamento da invoice ${invoice.invoiceNumber}`,
+        },
+      ],
+      { session },
+    );
+
+    await createNotification(
+      invoice.merchantId,
+      "Merchant",
+      "Fatura paga com sucesso",
+      `A invoice ${invoice.invoiceNumber} foi paga no valor de ${invoice.totalAmount} AOA`,
+      "transaction",
+      "high",
+      invoice._id,
+      "Invoice",
+    );
+
+    await createNotification(
+      studentId,
+      "User",
+      "Pagamento efetuado com sucesso",
+      `A sua fatura ${invoice.invoiceNumber} foi paga no valor de ${invoice.totalAmount} AOA`,
+      "info",
+      "low",
+      invoice._id,
+      "Invoice",
+    );
+
+    await session.commitTransaction();
+    session.endSession();
+
+    (async () => {
+      try {
+        const pdf = await generateInvoicePDF(invoice);
+        invoice.pdfUrl = pdf;
+        await invoice.save();
+
+        const io = getIO();
+        io.to(invoice.merchantId.toString()).emit("invoice:pdf_ready", {
+          invoiceId: invoice._id,
+          pdfUrl: pdf,
+        });
+      } catch (err) {
+        console.error("PDF error:", err);
+      }
+    })();
+
+    try {
+      const io = getIO();
+
+      io.to(studentId.toString()).emit("payment:invoice_paid", {
+        invoiceId: invoice._id,
+        amount: invoice.totalAmount,
+      });
+
+      io.to(invoice.merchantId.toString()).emit("payment:invoice_paid", {
+        invoiceId: invoice._id,
+        amount: invoice.totalAmount,
+      });
+
+      io.to(invoice.merchantId.toString()).emit("invoice:paid", {
+        invoiceId: invoice._id,
+        invoiceNumber: invoice.invoiceNumber,
+        amount: invoice.totalAmount,
+        studentId,
+      });
+
+      io.to(studentId.toString()).emit("wallet:updated");
+      io.to(invoice.merchantId.toString()).emit("wallet:updated");
+    } catch (socketErr) {
+      console.error("Socket error:", socketErr);
+    }
+
+    await writeAuditLog({
+      userId: studentId, userModel: "User", action: "INVOICE_PAYMENT_SUCCESS",
+      entity: "Invoice", entityId: invoice._id, status: "success",
+      schoolId: student.schoolId, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: { amount: invoice.totalAmount, invoiceNumber: invoice.invoiceNumber },
+    }).catch(() => {});
+
+    return res.status(200).send({
+      message: "Pagamento da invoice realizado com sucesso",
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+
+    return res.status(error.status || 500).send({
+      message: error.message,
+    });
+  }
+};
+
+export const payToSchool = async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    session.startTransaction();
+
+    const { rupeReference, pin } = req.body;
+    const studentId = req.user?._id;
+    if (!studentId || !rupeReference || !pin)
+      throw buildHttpError(400, "Dados incompletos");
+
+    //  Buscar o estudante e validar senha
+    const student = await User.findById(studentId)
+      .select("+pin")
+      .session(session);
+    if (!student) throw buildHttpError(404, "Estudante não encontrado");
+
+    const isMatch = await bcrypt.compare(pin, student.pin);
+    if (!isMatch) throw buildHttpError(401, "Pin incorreto");
+
+    //  Buscar RUPE
+    const rupe = await Rupe.findOne({
+      referencia: rupeReference,
+      estado: "PENDENTE",
+    }).session(session);
+    if (!rupe)
+      throw buildHttpError(409, "RUPE não encontrado ou já processado");
+
+    // Re-validate service is still active at payment time.
+    // A school admin could disable a service after the RUPE was created.
+    const serviceConfig = await ServicePrice.findOne({
+      schoolId: rupe.schoolId,
+      tipoServico: rupe.tipoServico,
+    }).session(session);
+    if (!serviceConfig || !serviceConfig.active) {
+      throw buildHttpError(403, "Serviço desativado. O pagamento não pode ser processado.");
+    }
+
+    //  Buscar escola vinculada ao RUPE
+    const school = await School.findById(rupe.schoolId)
+      .populate("walletId")
+      .session(session);
+    if (!school) throw buildHttpError(404, "Escola não encontrada");
+
+    if (!school.walletId)
+      throw buildHttpError(404, "Carteira da escola não encontrada");
+
+    //  Processar transação financeira (registrando no sistema)
+    const transaction = await processTransaction({
+      senderId: studentId,
+      senderType: "User",
+      receiverId: school._id,
+      receiverType: "School",
+      rupeReference: rupe.referencia,
+      externalReference: `RUPE:${rupe.referencia}`,
+      amount: rupe.valor,
+      type: "payment",
+      description: `Pagamento de ${rupe.tipoServico} para ${school.name}`,
+      session,
+    });
+
+    await createNotification(
+      school._id,
+      transaction.receiverType,
+      `Pagamento recebido ${rupe.tipoServico}`,
+      `Pagamneto realizado pelo estudante ${student.name} - ${student.processNumber}`,
+      "transaction",
+      "high",
+      transaction._id,
+      "Transaction",
+    );
+
+    const paidRupe = await Rupe.findOneAndUpdate(
+      { _id: rupe._id, estado: "PENDENTE" },
+      { $set: { estado: "PAGO" } },
+      { new: true, session },
+    );
+    if (!paidRupe) throw buildHttpError(409, "RUPE já processado");
+
+    //  Atualizar métricas da escola
+    applySchoolServiceMetrics(school, rupe);
+    await school.save({ session });
+
+    const refreshedSchoolWallet = await Wallet.findOne({
+      ownerId: school._id,
+      ownerModel: "School",
+    })
+      .select("balance")
+      .session(session);
+
+
+    // Commit da transação
+    await session.commitTransaction();
+    session.endSession();
+
+    try {
+      const io = getIO();
+      if (studentId) {
+        io.to(studentId.toString()).emit("payment:created", transaction);
+        io.to(studentId.toString()).emit("wallet:updated");
+      }
+      if (school?._id) {
+        io.to(school._id.toString()).emit("payment:received", transaction);
+        io.to(school._id.toString()).emit("wallet:updated");
+      }
+    } catch (socketErr) {
+      console.error("Socket error on payToSchool", socketErr);
+    }
+
+    await writeAuditLog({
+      userId: studentId, userModel: "User", action: "RUPE_PURCHASED",
+      entity: "Transaction", entityId: transaction._id, status: "success",
+      schoolId: school._id, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: { amount: rupe.valor, rupeReference: rupe.referencia, serviceType: rupe.tipoServico },
+    }).catch(() => {});
+
+    if (rupe.tipoServico === SERVICE_TYPE.EXAM_SHEET) {
+      await writeAuditLog({
+        userId: studentId, userModel: "User", action: "SHEETS_CONSUMED",
+        entity: "School", entityId: school._id, status: "success",
+        schoolId: school._id, ip: req.ip, userAgent: req.headers["user-agent"],
+        metadata: { quantity: rupe.quantidade, rupeReference: rupe.referencia },
+      }).catch(() => {});
+    }
+
+    return res.status(200).send({
+      message: "Pagamento realizado com sucesso",
+      transaction,
+      rupe: paidRupe,
+      walletBalance: refreshedSchoolWallet?.balance ?? null,
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    if (error?.code === 11000) {
+      return res.status(409).send({ message: "Transação já processada" });
+    }
+    return res.status(error.status || 500).send({ message: error.message });
+  }
+};
+
+export const payWithQrCode = async (req, res) => {
+  try {
+    const { merchantId, amount } = req.body;
+
+    if (!merchantId || !amount || amount <= 0) {
+      return res.status(400).json({ message: "Invalid merchant ID or amount" });
+    }
+
+    const merchant = await Merchant.findById(merchantId);
+    if (!merchant) {
+      return res.status(404).json({ message: "Merchant not found" });
+    }
+
+    const studentWallet = await Wallet.findOne({ ownerId: req.user._id });
+    if (!studentWallet) {
+      return res.status(404).json({ message: "Student wallet not found" });
+    }
+
+    if (studentWallet.balance < amount) {
+      return res.status(400).json({ message: "Insufficient balance" });
+    }
+
+    // Deduct balance
+    studentWallet.debit(amount);
+    await studentWallet.save();
+
+    // Credit merchant
+    const merchantWallet = await Wallet.findOne({ ownerId: merchant._id });
+    if (merchantWallet) {
+      merchantWallet.credit(amount);
+      await merchantWallet.save();
+    }
+
+    // Create transaction
+    const transaction = await Transaction.create({
+      senderId: req.user._id,
+      senderType: "User",
+      receiverId: merchant._id,
+      receiverType: "Merchant",
+      amount,
+      type: "payment",
+      status: "completed",
+      description: "QR Payment",
+    });
+
+    try {
+      const io = getIO();
+      if (req.user?._id) {
+        io.to(req.user._id.toString()).emit("payment:created", transaction);
+        io.to(req.user._id.toString()).emit("wallet:updated");
+      }
+      if (merchant?._id) {
+        io.to(merchant._id.toString()).emit("payment:received", transaction);
+        io.to(merchant._id.toString()).emit("wallet:updated");
+      }
+    } catch (socketErr) {
+      console.error("Socket error on payWithQrCode", socketErr);
+    }
+
+    await writeAuditLog({
+      userId: req.user._id, userModel: "User", action: "QR_PAYMENT_MADE",
+      entity: "Transaction", entityId: transaction._id, status: "success",
+      schoolId: null, ip: req.ip, userAgent: req.headers["user-agent"],
+      metadata: { amount, merchantId },
+    }).catch(() => {});
+
+    res.json({ message: "Payment successful", transaction });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+export const getPaymentByUser = async (req, res) => {
+  try {
+    const userId = req.user?._id?.toString();
+
+    const payments = await Transaction.find({
+      type: "payment",
+      $or: [{ senderId: userId }, { receiverId: userId }],
+    })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .lean();
+
+    const formatted = payments.map((tx) => ({
+      ...tx,
+      direction: tx.senderId?.toString() === userId ? "outgoing" : "incoming",
+    }));
+
+    res.status(200).send(formatted);
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+};
+/* =========================
+   CORE: SCHOOL PAYMENT
+========================= */
+const payToSchoolLogic = async ({ userId, rupeReference, session, auditContext = {} }) => {
+  const rupe = await Rupe.findOne({
+    referencia: rupeReference,
+    estado: "PENDENTE",
+  }).session(session);
+
+  if (!rupe) throw buildHttpError(404, "RUPE inválido");
+
+  // Validate service is still active (backend enforces, not frontend)
+  const serviceConfig = await ServicePrice.findOne({
+    schoolId: rupe.schoolId,
+    tipoServico: rupe.tipoServico,
+  }).session(session);
+  if (!serviceConfig || !serviceConfig.active) {
+    throw buildHttpError(403, "Serviço desativado. O pagamento não pode ser processado.");
+  }
+
+  const school = await School.findById(rupe.schoolId).session(session);
+  const student = await User.findById(userId).session(session);
+
+  if (!school || !student) throw buildHttpError(404, "Dados inválidos");
+
+  const transaction = await processTransaction({
+    senderId: userId,
+    senderType: "User",
+    receiverId: school._id,
+    receiverType: "School",
+    externalReference: generateReference("SCHOOL"),
+    amount: rupe.valor,
+    type: "payment",
+    description: "Pagamento escola",
+    session,
+  });
+
+  await Rupe.findByIdAndUpdate(rupe._id, { estado: "PAGO" }, { session });
+
+  // Apply school service metrics atomically within the same session.
+  // This was missing from this code path — sheets/docs were never decremented.
+  applySchoolServiceMetrics(school, rupe);
+  await school.save({ session });
+
+  await createNotification(
+    school._id,
+    "School",
+    "Pagamento recebido",
+    `Recebeste ${rupe.valor} KZ pelo serviço ${rupe.tipoServico} do estudante ${student.name}`,
+    "transaction",
+    "high",
+    transaction._id,
+    "Transaction",
+  );
+
+  await createNotification(
+    userId,
+    "User",
+    "Pagamento realizado",
+    `Pagaste ${rupe.valor} KZ pelo serviço ${rupe.tipoServico} para o estudante ${student.name}`,
+    "info",
+    "low",
+    transaction._id,
+    "Transaction",
+  );
+
+  await writeAuditLog({
+    userId, userModel: "User", action: "RUPE_PURCHASED",
+    entity: "Transaction", entityId: transaction._id, status: "success",
+    schoolId: school._id,
+    ip: auditContext.ip ?? null,
+    userAgent: auditContext.userAgent ?? null,
+    metadata: { amount: rupe.valor, rupeReference: rupe.referencia, serviceType: rupe.tipoServico },
+  }).catch(() => {});
+
+  return { transaction, receiverId: school._id };
+};
+
+/* =========================
+   CORE: INVOICE PAYMENT
+========================= */
+const makeInvoicePaymentLogic = async ({ userId, rupeReference, session, auditContext = {} }) => {
+let invoice
+   if (!mongoose.Types.ObjectId.isValid(rupeReference)) {
+     invoice = await Invoice.findOneAndUpdate(
+    {
+      rupeReference,
+      status: "pending",
+    },
+    {
+      $set: {
+        status: "processing",
+      },
+    },
+    {
+      new: true,
+      session,
+    },
+  );
+}else {
+   invoice = await Invoice.findOneAndUpdate(
+    {
+      _id: rupeReference,
+      status: "pending",
+    },
+    {
+      $set: {
+        status: "processing",
+      },
+    },
+    {
+      new: true,
+      session,
+    },
+  );
+}
+
+
+ 
+
+  if (!invoice) throw buildHttpError(404, "Factura não encontrada");
+
+  const user = await User.findById(userId).session(session);
+  const merchant = await Merchant.findById(invoice.merchantId).session(session)
+  if (!user) throw buildHttpError(404, "Usuário não encontrado");
+
+  const transaction = await processTransaction({
+    senderId: userId,
+    senderType: "User",
+    receiverId: invoice.merchantId,
+    receiverType: "Merchant",
+    externalReference: generateReference("INV"),
+    amount: invoice.totalAmount,
+    type: "payment",
+    description: `Pagamento da Factura ${invoice.invoiceNumber} do comerciante: ${merchant.name}`,
+    session,
+  });
+
+  invoice.status = "paid";
+  invoice.clientName = user.name || "Cliente";
+  invoice.clientEmail = user.email || "-";
+  await invoice.save({ session });
+
+  await generateInvoicePDF(invoice);
+
+  await createNotification(
+    invoice.merchantId,
+    "Merchant",
+    "Pagamento recebido",
+    `Recebeste ${invoice.totalAmount} KZ pela invoice ${invoice.invoiceNumber}`,
+    "transaction",
+    "high",
+    transaction._id,
+    "Transaction",
+  );
+
+  await createNotification(
+    userId,
+    "User",
+    "Pagamento realizado",
+    `Pagaste ${invoice.totalAmount} KZ pela invoice ${invoice.invoiceNumber}`,
+    "info",
+    "low",
+    transaction._id,
+    "Transaction",
+  );
+
+  await writeAuditLog({
+    userId, userModel: "User", action: "PAGAMENT_DE_FACTURA",
+    entity: "FACTURA", entityId: invoice._id, status: "success",
+    schoolId: user.schoolId,
+    ip: auditContext.ip ?? null,
+    userAgent: auditContext.userAgent ?? null,
+    metadata: { amount: invoice.totalAmount, invoiceNumber: invoice.invoiceNumber },
+  }).catch(() => {});
+
+  return { transaction, receiverId: invoice.merchantId };
+};
+
+/* =========================
+   CORE: QR PAYMENT
+========================= */
+const qrPaymentLogic = async ({ userId, extra, session, auditContext = {} }) => {
+  const { merchantId, amount } = extra;
+  const student = await User.findById(userId).session(session);
+
+  const transaction = await processTransaction({
+    senderId: userId,
+    senderType: "User",
+    receiverId: merchantId,
+    receiverType: "Merchant",
+    externalReference: generateReference("QR"),
+    amount,
+    type: "payment",
+    description: "QR Payment",
+    session,
+  });
+
+  await createNotification(
+    merchantId,
+    "Merchant",
+    "Pagamento recebido",
+    `Recebeste ${amount} KZ pelo pagamento QR`,
+    "transaction",
+    "high",
+    transaction._id,
+    "Transaction",
+  );
+
+  await writeAuditLog({
+    userId, userModel: "User", action: "QR_PAYMENT_MADE",
+    entity: "Transaction", entityId: transaction._id, status: "success",
+    schoolId: student?.schoolId ?? null,
+    ip: auditContext.ip ?? null,
+    userAgent: auditContext.userAgent ?? null,
+    metadata: { amount, merchantId },
+  }).catch(() => {});
+
+  return { transaction, receiverId: merchantId };
+};
+
+/* =========================
+   EXECUTE PAYMENT (MAIN)
+========================= */
+export const executePayment = async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    session.startTransaction();
+
+    const { type, rupeReference, pin, extra } = req.body;
+    const userId = req.user?._id;
+
+    if (!type || !pin) {
+      throw buildHttpError(400, "Dados incompletos");
+    }
+
+    const user = await User.findById(userId).select("+pin").session(session);
+
+    const isMatch = await bcrypt.compare(pin, user.pin);
+    if (!isMatch) throw buildHttpError(401, "PIN inválido");
+
+    const auditContext = {
+      ip: req.ip,
+      userAgent: req.headers["user-agent"],
+    };
+
+    let result;
+
+    if (type === "SCHOOL") {
+      result = await payToSchoolLogic({ userId, rupeReference, session, auditContext });
+    } else if (type === "INVOICE") {
+      result = await makeInvoicePaymentLogic({
+        userId,
+        rupeReference,
+        session,
+        auditContext,
+      });
+
+      if (!result)
+        throw buildHttpError(500, "Erro ao processar pagamento da invoice");
+
+      // NOTA: wallet já foi creditada dentro de processTransaction() em makeInvoicePaymentLogic.
+      // NÃO fazer wallet.credit() aqui — causaria double credit na wallet do merchant.
+    } else if (type === "QR") {
+      result = await qrPaymentLogic({ userId, extra, session, auditContext });
+    } else throw buildHttpError(400, "Tipo inválido");
+
+    await session.commitTransaction();
+    session.endSession();
+
+    //SOCKET CENTRALIZADO (ÚNICO LUGAR)
+    emitPaymentEvents({
+      senderId: userId,
+      receiverId: result.receiverId,
+      transaction: result.transaction,
+    });
+
+    return res.json({
+      message: "Pagamento realizado com sucesso",
+      data: result,
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+
+    return res.status(error.status || 500).json({
+      message: error.message,
+    });
+  }
+};

@@ -1,0 +1,98 @@
+import Wallet from "../models/wallet.js";
+import mongoose from "mongoose";
+import Transaction from "../models/transaction.js";
+
+export const getWallet = async (req, res) => {
+    try{
+        const { userId, model } = req.params
+        const actorId = req.user?._id?.toString();
+        const actorModel = req.userModel;
+
+        if (!actorId || !actorModel) {
+          return res.status(401).send({ message: "Não autenticado" });
+        }
+
+        if (actorId !== userId || actorModel !== model) {
+          return res.status(403).send({ message: "Acesso negado a carteira" });
+        }
+
+        const wallet = await Wallet.findOne({ ownerId: userId, ownerModel: model })
+
+        if (!wallet) return res.status(404).send({ message: 'wallet not found '})
+            
+        res.status(200).send(wallet)
+    } catch (err) {
+        res.status(500).send({ message: 'erro ao pegar cartiera: ' + err.message})
+    }
+}
+
+export const addBalance = async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    session.startTransaction();
+
+    const { amount } = req.body;
+    const userId = req.user?._id;
+    const numericAmount = Number(amount);
+
+    if (!userId) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(401).send({ message: "Não autenticado" });
+    }
+
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).send({ message: "Valor inválido para recarga" });
+    }
+
+    const wallet = await Wallet.findOne(
+      { ownerId: userId, ownerModel: "User" },
+      null,
+      { session }
+    );
+
+    if (!wallet) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).send({ message: "Carteira não encontrada" });
+    }
+
+    // atualizar saldo
+    wallet.balance += numericAmount;
+    await wallet.save({ session });
+
+    // criar transação
+    await Transaction.create(
+      [
+        {
+          receiverId: userId,
+          senderType: "User",
+          receiverType: "User",
+          amount: numericAmount,
+          type: "recharge",
+          description: "Adição de saldo na carteira",
+          status: "completed",
+        },
+      ],
+      { session }
+    );
+
+    await session.commitTransaction();
+    session.endSession();
+
+    res.status(200).send({
+      message: "Saldo adicionado com sucesso",
+      newBalance: wallet.balance,
+    });
+
+  } catch (error) {
+
+    await session.abortTransaction();
+    session.endSession();
+
+    res.status(500).send({ message: error.message });
+  }
+};
